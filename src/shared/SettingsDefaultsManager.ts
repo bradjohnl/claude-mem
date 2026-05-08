@@ -22,6 +22,11 @@ export interface SettingsDefaults {
   CLAUDE_MEM_OPENROUTER_APP_NAME: string;
   CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES: string;
   CLAUDE_MEM_OPENROUTER_MAX_TOKENS: string;
+  CLAUDE_MEM_OPENAI_COMPATIBLE_BASE_URL: string;
+  CLAUDE_MEM_OPENAI_COMPATIBLE_API_KEY: string;
+  CLAUDE_MEM_OPENAI_COMPATIBLE_MODEL: string;
+  CLAUDE_MEM_OPENAI_COMPATIBLE_MAX_CONTEXT_MESSAGES: string;
+  CLAUDE_MEM_OPENAI_COMPATIBLE_MAX_TOKENS: string;
   CLAUDE_MEM_DATA_DIR: string;
   CLAUDE_MEM_LOG_LEVEL: string;
   CLAUDE_MEM_PYTHON_VERSION: string;
@@ -94,6 +99,14 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_OPENROUTER_APP_NAME: 'claude-mem',  // App name for OpenRouter analytics
     CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES: '20',  // Max messages in context window
     CLAUDE_MEM_OPENROUTER_MAX_TOKENS: '100000',  // Max estimated tokens (~100k safety limit)
+    // OpenAI-compatible provider — for self-hosted llama.cpp / Ollama / vLLM / LiteLLM
+    // and any other service speaking the OpenAI /v1/chat/completions protocol.
+    // Set CLAUDE_MEM_PROVIDER=openai-compatible to activate.
+    CLAUDE_MEM_OPENAI_COMPATIBLE_BASE_URL: '',  // REQUIRED, e.g. http://127.0.0.1:8085/v1 or https://your-litellm.example.com/v1
+    CLAUDE_MEM_OPENAI_COMPATIBLE_API_KEY: '',   // Optional; defaults to "dummy" if endpoint requires *some* bearer token but doesn't validate it
+    CLAUDE_MEM_OPENAI_COMPATIBLE_MODEL: '',     // REQUIRED, model identifier as the endpoint expects it
+    CLAUDE_MEM_OPENAI_COMPATIBLE_MAX_CONTEXT_MESSAGES: '20',
+    CLAUDE_MEM_OPENAI_COMPATIBLE_MAX_TOKENS: '100000',
     CLAUDE_MEM_DATA_DIR: join(homedir(), '.claude-mem'),
     CLAUDE_MEM_LOG_LEVEL: 'INFO',
     CLAUDE_MEM_PYTHON_VERSION: '3.13',
