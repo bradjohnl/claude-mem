@@ -27,6 +27,11 @@ const CONTEXT_GENERATOR = {
   source: 'src/services/context-generator.ts'
 };
 
+const DRAIN_SERVICE = {
+  name: 'drain-service',
+  source: 'src/services/drain-service.ts'
+};
+
 function stripHardcodedDirname(filePath) {
   let content = fs.readFileSync(filePath, 'utf-8');
   const before = content.length;
@@ -205,6 +210,38 @@ async function buildHooks() {
     fs.chmodSync(`${hooksDir}/${SERVER_BETA_SERVICE.name}.cjs`, 0o755);
     const serverBetaStats = fs.statSync(`${hooksDir}/${SERVER_BETA_SERVICE.name}.cjs`);
     console.log(`✓ server-beta-service built (${(serverBetaStats.size / 1024).toFixed(2)} KB)`);
+
+    console.log(`\n🔧 Building drain service (Phase 2 inert)...`);
+    await build({
+      entryPoints: [DRAIN_SERVICE.source],
+      bundle: true,
+      platform: 'node',
+      target: 'node18',
+      format: 'cjs',
+      outfile: `${hooksDir}/${DRAIN_SERVICE.name}.cjs`,
+      minify: true,
+      logLevel: 'error',
+      external: [
+        'bun:sqlite',
+        'zod',
+      ],
+      define: {
+        '__DEFAULT_PACKAGE_VERSION__': `"${version}"`
+      },
+      banner: {
+        js: [
+          '#!/usr/bin/env bun',
+          'var __filename = __filename || require("node:path").resolve(process.argv[1] || "");',
+          'var __dirname = __dirname || require("node:path").dirname(__filename);'
+        ].join('\n')
+      }
+    });
+
+    stripHardcodedDirname(`${hooksDir}/${DRAIN_SERVICE.name}.cjs`);
+
+    fs.chmodSync(`${hooksDir}/${DRAIN_SERVICE.name}.cjs`, 0o755);
+    const drainStats = fs.statSync(`${hooksDir}/${DRAIN_SERVICE.name}.cjs`);
+    console.log(`✓ drain-service built (${(drainStats.size / 1024).toFixed(2)} KB)`);
 
     console.log(`\n🔧 Building MCP server...`);
     await build({
