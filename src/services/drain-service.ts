@@ -14,6 +14,11 @@ import { logger } from '../utils/logger.js';
 import { homedir } from 'os';
 import { join } from 'path';
 import { existsSync } from 'fs';
+import { DatabaseManager } from './worker/DatabaseManager.js';
+import { SessionManager } from './worker/SessionManager.js';
+import { ClaudeProvider } from './worker/ClaudeProvider.js';
+import { GeminiProvider, isGeminiSelected, isGeminiAvailable } from './worker/GeminiProvider.js';
+import { OpenRouterProvider, isOpenRouterSelected, isOpenRouterAvailable } from './worker/OpenRouterProvider.js';
 
 const POLL_INTERVAL_MS = parseInt(process.env.CLAUDE_MEM_DRAIN_POLL_MS || '2000', 10);
 const DATA_DIR = process.env.CLAUDE_MEM_DATA_DIR || join(homedir(), '.claude-mem');
@@ -60,24 +65,55 @@ async function readQueueStats(): Promise<QueueStats | null> {
   }
 }
 
-async function runDrainLoop(): Promise<void> {
+interface DrainContext {
+  dbManager: DatabaseManager;
+  sessionManager: SessionManager;
+  claudeProvider: ClaudeProvider;
+  geminiProvider: GeminiProvider;
+  openRouterProvider: OpenRouterProvider;
+}
+
+async function initializeDrainContext(): Promise<DrainContext> {
+  logger.info('DRAIN', 'initializing drain context (DB + providers)');
+
+  const dbManager = new DatabaseManager();
+  await dbManager.initialize();
+
+  const sessionManager = new SessionManager(dbManager);
+  const claudeProvider = new ClaudeProvider(dbManager, sessionManager);
+  const geminiProvider = new GeminiProvider(dbManager, sessionManager);
+  const openRouterProvider = new OpenRouterProvider(dbManager, sessionManager);
+
+  logger.info('DRAIN', 'drain context ready', {
+    claudeProviderReady: !!claudeProvider,
+    geminiProviderReady: !!geminiProvider,
+    openRouterProviderReady: !!openRouterProvider
+  });
+
+  return { dbManager, sessionManager, claudeProvider, geminiProvider, openRouterProvider };
+}
+
+function getSelectedProvider(): 'claude' | 'gemini' | 'openrouter' {
+  if (isOpenRouterSelected() && isOpenRouterAvailable()) return 'openrouter';
+  if (isGeminiSelected() && isGeminiAvailable()) return 'gemini';
+  return 'claude';
+}
+
+async function runDrainLoop(ctx: DrainContext | null): Promise<void> {
   let tickCount = 0;
   while (!shuttingDown) {
     tickCount++;
-    // Phase 3b will add the actual write path here:
-    //   1. SELECT pending_messages WHERE status='pending' LIMIT N
-    //   2. UPDATE ... SET status='processing'
-    //   3. Call provider.startSession against the enrichment llama-server (:8086)
-    //   4. Write results back, mark 'done' or 'failed'
-    //   5. Tick ChromaSync.backfillAllProjects on a slower cadence
-    //
-    // For now: report queue depth every 30 ticks (~1 min at default 2s poll)
     if (tickCount % 30 === 1) {
       const stats = await readQueueStats();
       if (stats) {
-        logger.info('DRAIN', 'queue depth', stats);
+        logger.info('DRAIN', 'queue depth', { ...stats, selectedProvider: ctx ? getSelectedProvider() : 'none' });
       }
     }
+    // Phase 3c will add the actual write path here:
+    //   1. SELECT pending_messages WHERE status='pending' LIMIT N → group by session
+    //   2. For each session: ctx.sessionManager.getSession() + provider.startSession()
+    //   3. Mark done/failed
+    //   4. Tick ChromaSync.backfillAllProjects on a slower cadence
     await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
   }
 }
@@ -112,14 +148,25 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  logger.info('DRAIN', 'drain-service starting (Phase 2 inert skeleton)', {
+  logger.info('DRAIN', 'drain-service starting (Phase 3b: deps wired, processing deferred to 3c)', {
     pid: process.pid,
     pollIntervalMs: POLL_INTERVAL_MS,
     splitDaemonFlag: process.env.CLAUDE_MEM_SPLIT_DAEMON || 'unset'
   });
 
   installSignalHandlers();
-  await runDrainLoop();
+
+  // Best-effort dep init. If anything throws we fall back to read-only queue
+  // stats — drain stays alive and useful for diagnostics even if providers
+  // can't be instantiated (e.g. missing API key, DB lock).
+  let ctx: DrainContext | null = null;
+  try {
+    ctx = await initializeDrainContext();
+  } catch (err) {
+    logger.error('DRAIN', 'drain context init failed (continuing in read-only mode)', {}, err instanceof Error ? err : new Error(String(err)));
+  }
+
+  await runDrainLoop(ctx);
 
   logger.info('DRAIN', 'drain-service exited cleanly');
   process.exit(0);

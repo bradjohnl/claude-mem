@@ -211,7 +211,7 @@ async function buildHooks() {
     const serverBetaStats = fs.statSync(`${hooksDir}/${SERVER_BETA_SERVICE.name}.cjs`);
     console.log(`✓ server-beta-service built (${(serverBetaStats.size / 1024).toFixed(2)} KB)`);
 
-    console.log(`\n🔧 Building drain service (Phase 2 inert)...`);
+    console.log(`\n🔧 Building drain service...`);
     await build({
       entryPoints: [DRAIN_SERVICE.source],
       bundle: true,
@@ -224,15 +224,21 @@ async function buildHooks() {
       external: [
         'bun:sqlite',
         'zod',
+        'cohere-ai',
+        'ollama',
+        '@chroma-core/default-embed',
+        'onnxruntime-node'
       ],
       define: {
-        '__DEFAULT_PACKAGE_VERSION__': `"${version}"`
+        '__DEFAULT_PACKAGE_VERSION__': `"${version}"`,
+        'import.meta.url': '__IMPORT_META_URL__'
       },
       banner: {
         js: [
           '#!/usr/bin/env bun',
           'var __filename = __filename || require("node:path").resolve(process.argv[1] || "");',
-          'var __dirname = __dirname || require("node:path").dirname(__filename);'
+          'var __dirname = __dirname || require("node:path").dirname(__filename);',
+          'var __IMPORT_META_URL__ = require("node:url").pathToFileURL(__filename).href;'
         ].join('\n')
       }
     });
