@@ -73,6 +73,16 @@ interface DrainContext {
   openRouterProvider: OpenRouterProvider;
 }
 
+// Whether drain should actually call provider.startSession on pending rows.
+// Default: false (safe — drain reports queue stats only). Lock-driven
+// orchestrator (memory-drain-on-lock.sh) sets this to '1' on lock to begin
+// actual drain. This prevents foreground GPU use even if drain is started
+// manually for testing.
+const DRAIN_ACTIVE = process.env.CLAUDE_MEM_DRAIN_ACTIVE === '1';
+
+// Per-tick session cap. Sequential one-at-a-time keeps llama-server simple.
+const MAX_SESSIONS_PER_TICK = parseInt(process.env.CLAUDE_MEM_DRAIN_MAX_PER_TICK || '1', 10);
+
 async function initializeDrainContext(): Promise<DrainContext> {
   logger.info('DRAIN', 'initializing drain context (DB + providers)');
 
@@ -99,6 +109,64 @@ function getSelectedProvider(): 'claude' | 'gemini' | 'openrouter' {
   return 'claude';
 }
 
+// Drain a single session: initialize, pick provider, run startSession.
+// Errors are caught and logged so one bad session doesn't kill the drain.
+async function drainSession(ctx: DrainContext, sessionDbId: number): Promise<void> {
+  const session = ctx.sessionManager.initializeSession(sessionDbId);
+  if (!session) {
+    logger.warn('DRAIN', 'session not found', { sessionDbId });
+    return;
+  }
+  if (session.generatorPromise) {
+    logger.debug('DRAIN', 'session already has active generator, skipping', { sessionDbId });
+    return;
+  }
+
+  const provider = getSelectedProvider();
+  const agent = provider === 'openrouter' ? ctx.openRouterProvider
+              : provider === 'gemini' ? ctx.geminiProvider
+              : ctx.claudeProvider;
+
+  if (session.abortController.signal.aborted) {
+    session.abortController = new AbortController();
+  }
+  session.currentProvider = provider;
+  session.lastGeneratorActivity = Date.now();
+
+  logger.info('DRAIN', 'starting session', { sessionDbId, provider, historyLength: session.conversationHistory.length });
+
+  try {
+    // WorkerRef is optional — drain has no SSE/HTTP, so pass undefined.
+    await agent.startSession(session, undefined);
+    logger.info('DRAIN', 'session drained', { sessionDbId, provider });
+  } catch (err) {
+    logger.error('DRAIN', 'session drain failed', { sessionDbId, provider }, err instanceof Error ? err : new Error(String(err)));
+    try {
+      const reset = await ctx.sessionManager.resetProcessingToPending(sessionDbId);
+      if (reset > 0) logger.info('DRAIN', 'reset processing rows back to pending after failure', { sessionDbId, reset });
+    } catch { /* best-effort */ }
+  } finally {
+    session.generatorPromise = undefined;
+  }
+}
+
+// Returns up to MAX_SESSIONS_PER_TICK distinct session_dbids that have pending rows.
+function nextPendingSessions(ctx: DrainContext): number[] {
+  try {
+    const rows = ctx.dbManager.getSessionStore().db.prepare(`
+      SELECT DISTINCT session_dbid
+      FROM pending_messages
+      WHERE status = 'pending'
+      ORDER BY session_dbid ASC
+      LIMIT ?
+    `).all(MAX_SESSIONS_PER_TICK) as { session_dbid: number }[];
+    return rows.map(r => r.session_dbid);
+  } catch (err) {
+    logger.debug('DRAIN', 'next pending lookup failed', { error: err instanceof Error ? err.message : String(err) });
+    return [];
+  }
+}
+
 async function runDrainLoop(ctx: DrainContext | null): Promise<void> {
   let tickCount = 0;
   while (!shuttingDown) {
@@ -106,14 +174,24 @@ async function runDrainLoop(ctx: DrainContext | null): Promise<void> {
     if (tickCount % 30 === 1) {
       const stats = await readQueueStats();
       if (stats) {
-        logger.info('DRAIN', 'queue depth', { ...stats, selectedProvider: ctx ? getSelectedProvider() : 'none' });
+        logger.info('DRAIN', 'queue depth', {
+          ...stats,
+          selectedProvider: ctx ? getSelectedProvider() : 'none',
+          drainActive: DRAIN_ACTIVE
+        });
       }
     }
-    // Phase 3c will add the actual write path here:
-    //   1. SELECT pending_messages WHERE status='pending' LIMIT N → group by session
-    //   2. For each session: ctx.sessionManager.getSession() + provider.startSession()
-    //   3. Mark done/failed
-    //   4. Tick ChromaSync.backfillAllProjects on a slower cadence
+
+    if (ctx && DRAIN_ACTIVE) {
+      // Active drain: process one (or N) pending session per tick. Sequential
+      // to keep llama-server :8086 from being overloaded.
+      const pending = nextPendingSessions(ctx);
+      for (const sessionDbId of pending) {
+        if (shuttingDown) break;
+        await drainSession(ctx, sessionDbId);
+      }
+    }
+
     await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
   }
 }
@@ -148,10 +226,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  logger.info('DRAIN', 'drain-service starting (Phase 3b: deps wired, processing deferred to 3c)', {
+  logger.info('DRAIN', 'drain-service starting (Phase 3c: provider.startSession wired, gated by CLAUDE_MEM_DRAIN_ACTIVE)', {
     pid: process.pid,
     pollIntervalMs: POLL_INTERVAL_MS,
-    splitDaemonFlag: process.env.CLAUDE_MEM_SPLIT_DAEMON || 'unset'
+    splitDaemonFlag: process.env.CLAUDE_MEM_SPLIT_DAEMON || 'unset',
+    drainActive: DRAIN_ACTIVE,
+    maxSessionsPerTick: MAX_SESSIONS_PER_TICK
   });
 
   installSignalHandlers();
