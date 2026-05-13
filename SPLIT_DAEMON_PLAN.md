@@ -32,11 +32,39 @@ Split into two cooperating daemons:
 
 ## Phased commits
 
-1. **Phase 1 — no-op refactor (this session, branch `refactor/initialize-phases`)**: split `initializeBackground` in `src/services/worker-service.ts` into `initializeIntakePhase()` + `initializeProviderPhase()`. Both run sequentially. Build, smoke-test all 5 hooks, push.
-2. **Phase 2** — new `src/services/drain-service.ts` containing only the provider-phase logic + a polling loop. New `scripts/build-drain.js` emitting `plugin/scripts/drain-service.cjs`. Inert (not wired up).
-3. **Phase 3** — flip behind `CLAUDE_MEM_SPLIT_DAEMON=1`. Intake skips `initializeProviderPhase` + `attachIngestGeneratorStarter`. Drain owns it. Provision `claude-mem-enrich-llama-server.service` + download Qwen3-0.6B.
-4. **Phase 4** — `drain start/stop/status` CLI; integrate with `memory-drain-on-lock.sh` so lock spawns drain + enrich-llama-server, unlock kills both.
-5. **Phase 5** — strip provider deps from intake bundle (smaller, faster cold start).
+1. **Phase 1 — no-op refactor** ✅ shipped (commit `faadc684`): `initializeBackground` split into `initializeIntakePhase()` + `initializeProviderPhase()`.
+2. **Phase 2 — drain skeleton** ✅ shipped (commit `47a31166`): `src/services/drain-service.ts` + build target.
+3. **Phase 3a — flag flip** ✅ shipped (commit `cbf808c1`): `CLAUDE_MEM_SPLIT_DAEMON=1` toggles intake/drain split.
+4. **Phase 3b — provider dep graph standalone** ✅ shipped (commit `2ab98705`): drain instantiates `DatabaseManager` + `SessionManager` + all 3 providers without worker-service.
+5. **Phase 3c — `provider.startSession()` wired** ✅ shipped (commit `eb41ddb7`): drain calls real LLM path, gated by `CLAUDE_MEM_DRAIN_ACTIVE=1`.
+6. **Phase 4 — lifecycle wiring**: ⛔ **DEFERRED — see "Hardware constraint" below**.
+7. **Phase 5 — intake bundle slim-down**: ⛔ deferred (depends on Phase 4).
+
+## Hardware constraint (2026-05-13 evening)
+
+Phase 4 originally proposed a dedicated `claude-mem-enrich-llama-server.service` running Qwen3-0.6B Q8_0 on port `:8086`, idle-gated so the foreground Qwen3.6-35B (port `:8085`) stayed VRAM-isolated from drain work.
+
+**Measured cost** (RTX 3080 Laptop, 16 GB VRAM, Qwen3.6-35B always-resident at ~12 GB):
+| Enrich ctx | Footprint | Free VRAM |
+|-----------:|----------:|----------:|
+| 32K        | 1910 MiB  | -27 MiB (rejected by `-fit on`) |
+| 16K        | 1904 MiB  | 624 MiB (dangerously tight) |
+| 8K         | 1652 MiB  | 875 MiB (workable, but long sessions truncate) |
+
+llama-server's static overhead is ~900 MB regardless of context size (model + compute buffer + slot reservation). Static is the bottleneck, not KV cache.
+
+**User decision**: don't run a second model. Drain points at the existing `:8085` Qwen3.6-35B endpoint — same model handles both foreground and enrichment. This is exactly what the upstream claude-mem already does; we don't need Phase 4 to achieve the GPU gate.
+
+## What the in-place mechanism achieves (no Phase 4 needed for v1)
+
+`~/.local/bin/memory-drain-on-lock.sh` already gates GPU work without the split-daemon split:
+
+- **Foreground** (screen unlocked): 10s level-triggered loop kills any `worker-service.cjs --daemon` that hooks/scripts spawn. Qwen3.6-35B sits resident but idle. Hooks still enqueue to SQLite normally.
+- **Locked**: D-Bus signal triggers `on_lock` → `wake_orphan_generators.py` spawns worker, which drains the queue against Qwen3.6-35B. Standard upstream behavior, just gated.
+
+The split-daemon code (Phases 1-3c) is preserved on the fork as **architectural prep** in case future hardware (more VRAM, or a dedicated CPU-only drain target) makes a true split useful. It is NOT required to operate the gate today.
+
+## Risks tracked (historical, kept for reference)
 
 ## Risks tracked
 
