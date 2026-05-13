@@ -306,120 +306,138 @@ export class WorkerService implements WorkerRef {
     try {
       logger.info('WORKER', 'Background initialization starting...');
 
-      const { ModeManager } = await import('./domain/ModeManager.js');
       const { SettingsDefaultsManager } = await import('../shared/SettingsDefaultsManager.js');
       const { USER_SETTINGS_PATH } = await import('../shared/paths.js');
-
       const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
 
-      const modeId = settings.CLAUDE_MEM_MODE;
-      ModeManager.getInstance().loadMode(modeId);
-      logger.info('SYSTEM', `Mode loaded: ${modeId}`);
-
-      if (settings.CLAUDE_MEM_MODE === 'local' || !settings.CLAUDE_MEM_MODE) {
-        logger.info('WORKER', 'Checking for one-time Chroma migration...');
-        runOneTimeChromaMigration();
-      }
-
-      logger.info('WORKER', 'Checking for one-time CWD remap...');
-      runOneTimeCwdRemap();
-
-      logger.info('WORKER', 'Adopting merged worktrees (background)...');
-      adoptMergedWorktreesForAllKnownRepos({}).then(adoptions => {
-        if (adoptions) {
-          for (const adoption of adoptions) {
-            if (adoption.adoptedObservations > 0 || adoption.adoptedSummaries > 0 || adoption.chromaUpdates > 0) {
-              logger.info('SYSTEM', 'Merged worktrees adopted in background', adoption);
-            }
-            if (adoption.errors.length > 0) {
-              logger.warn('SYSTEM', 'Worktree adoption had per-branch errors', {
-                repoPath: adoption.repoPath,
-                errors: adoption.errors
-              });
-            }
-          }
-        }
-      }).catch(err => {
-        logger.error('WORKER', 'Worktree adoption failed (background)', {}, err instanceof Error ? err : new Error(String(err)));
-      });
-
-      const chromaEnabled = settings.CLAUDE_MEM_CHROMA_ENABLED !== 'false';
-      if (chromaEnabled) {
-        this.chromaMcpManager = ChromaMcpManager.getInstance();
-        logger.info('SYSTEM', 'ChromaMcpManager initialized (lazy - connects on first use)');
-      } else {
-        logger.info('SYSTEM', 'Chroma disabled via CLAUDE_MEM_CHROMA_ENABLED=false, skipping ChromaMcpManager');
-      }
-
-      logger.info('WORKER', 'Initializing database manager...');
-      await this.dbManager.initialize();
-
-      const sweepResult = this.dbManager.getSessionStore().db.prepare(`
-        UPDATE pending_messages
-           SET status = 'pending'
-         WHERE status = 'processing'
-      `).run();
-
-      if (sweepResult.changes > 0) {
-        logger.info('SYSTEM', `Startup orphan sweep reclaimed ${sweepResult.changes} processing rows`);
-      }
-
-      runOneTimeV12_4_3Cleanup();
-
-      logger.info('WORKER', 'Initializing search services...');
-      const formattingService = new FormattingService();
-      const timelineService = new TimelineService();
-      const searchManager = new SearchManager(
-        this.dbManager.getSessionSearch(),
-        this.dbManager.getSessionStore(),
-        this.dbManager.getChromaSync(),
-        formattingService,
-        timelineService
-      );
-      this.searchRoutes = new SearchRoutes(searchManager);
-      this.server.registerRoutes(this.searchRoutes);
-      logger.info('WORKER', 'SearchManager initialized and search routes registered');
-
-      const { SearchOrchestrator } = await import('./worker/search/SearchOrchestrator.js');
-      const corpusSearchOrchestrator = new SearchOrchestrator(
-        this.dbManager.getSessionSearch(),
-        this.dbManager.getSessionStore(),
-        this.dbManager.getChromaSync()
-      );
-      const corpusBuilder = new CorpusBuilder(
-        this.dbManager.getSessionStore(),
-        corpusSearchOrchestrator,
-        this.corpusStore
-      );
-      const knowledgeAgent = new KnowledgeAgent(this.corpusStore);
-      this.server.registerRoutes(new CorpusRoutes(this.corpusStore, corpusBuilder, knowledgeAgent));
-      logger.info('WORKER', 'CorpusRoutes registered');
-
-      this.initializationCompleteFlag = true;
-      this.resolveInitialization();
-      logger.info('SYSTEM', 'Core initialization complete (DB + search ready)');
-
-      await this.startTranscriptWatcher(settings);
-
-      if (this.chromaMcpManager) {
-        ChromaSync.backfillAllProjects(this.dbManager.getSessionStore()).then(() => {
-          logger.info('CHROMA_SYNC', 'Backfill check complete for all projects');
-        }).catch(error => {
-          logger.error('CHROMA_SYNC', 'Backfill failed (non-blocking)', {}, error as Error);
-        });
-      }
-
-      const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');
-      this.mcpReady = existsSync(mcpServerPath);
-
-      this.runMcpSelfCheck(mcpServerPath).catch(err => {
-        logger.debug('WORKER', 'MCP self-check failed (non-fatal)', { error: err.message });
-      });
+      await this.initializeIntakePhase(settings);
+      await this.initializeProviderPhase(settings);
 
       return;
     } catch (error) {
       logger.error('SYSTEM', 'Background initialization failed', {}, error instanceof Error ? error : undefined);
     }
+  }
+
+  // INTAKE phase: CPU-only, DB + search bootstrap. No LLM dependency at startup.
+  // Safe to run even when the enrichment llama-server is offline. This phase
+  // brings the HTTP API to a state where hooks can enqueue observations and
+  // search-only routes can serve.
+  private async initializeIntakePhase(
+    settings: ReturnType<typeof import('../shared/SettingsDefaultsManager.js').SettingsDefaultsManager.loadFromFile>
+  ): Promise<void> {
+    const { ModeManager } = await import('./domain/ModeManager.js');
+
+    const modeId = settings.CLAUDE_MEM_MODE;
+    ModeManager.getInstance().loadMode(modeId);
+    logger.info('SYSTEM', `Mode loaded: ${modeId}`);
+
+    if (settings.CLAUDE_MEM_MODE === 'local' || !settings.CLAUDE_MEM_MODE) {
+      logger.info('WORKER', 'Checking for one-time Chroma migration...');
+      runOneTimeChromaMigration();
+    }
+
+    logger.info('WORKER', 'Checking for one-time CWD remap...');
+    runOneTimeCwdRemap();
+
+    logger.info('WORKER', 'Adopting merged worktrees (background)...');
+    adoptMergedWorktreesForAllKnownRepos({}).then(adoptions => {
+      if (adoptions) {
+        for (const adoption of adoptions) {
+          if (adoption.adoptedObservations > 0 || adoption.adoptedSummaries > 0 || adoption.chromaUpdates > 0) {
+            logger.info('SYSTEM', 'Merged worktrees adopted in background', adoption);
+          }
+          if (adoption.errors.length > 0) {
+            logger.warn('SYSTEM', 'Worktree adoption had per-branch errors', {
+              repoPath: adoption.repoPath,
+              errors: adoption.errors
+            });
+          }
+        }
+      }
+    }).catch(err => {
+      logger.error('WORKER', 'Worktree adoption failed (background)', {}, err instanceof Error ? err : new Error(String(err)));
+    });
+
+    const chromaEnabled = settings.CLAUDE_MEM_CHROMA_ENABLED !== 'false';
+    if (chromaEnabled) {
+      this.chromaMcpManager = ChromaMcpManager.getInstance();
+      logger.info('SYSTEM', 'ChromaMcpManager initialized (lazy - connects on first use)');
+    } else {
+      logger.info('SYSTEM', 'Chroma disabled via CLAUDE_MEM_CHROMA_ENABLED=false, skipping ChromaMcpManager');
+    }
+
+    logger.info('WORKER', 'Initializing database manager...');
+    await this.dbManager.initialize();
+
+    const sweepResult = this.dbManager.getSessionStore().db.prepare(`
+      UPDATE pending_messages
+         SET status = 'pending'
+       WHERE status = 'processing'
+    `).run();
+
+    if (sweepResult.changes > 0) {
+      logger.info('SYSTEM', `Startup orphan sweep reclaimed ${sweepResult.changes} processing rows`);
+    }
+
+    runOneTimeV12_4_3Cleanup();
+
+    logger.info('WORKER', 'Initializing search services...');
+    const formattingService = new FormattingService();
+    const timelineService = new TimelineService();
+    const searchManager = new SearchManager(
+      this.dbManager.getSessionSearch(),
+      this.dbManager.getSessionStore(),
+      this.dbManager.getChromaSync(),
+      formattingService,
+      timelineService
+    );
+    this.searchRoutes = new SearchRoutes(searchManager);
+    this.server.registerRoutes(this.searchRoutes);
+    logger.info('WORKER', 'SearchManager initialized and search routes registered');
+
+    const { SearchOrchestrator } = await import('./worker/search/SearchOrchestrator.js');
+    const corpusSearchOrchestrator = new SearchOrchestrator(
+      this.dbManager.getSessionSearch(),
+      this.dbManager.getSessionStore(),
+      this.dbManager.getChromaSync()
+    );
+    const corpusBuilder = new CorpusBuilder(
+      this.dbManager.getSessionStore(),
+      corpusSearchOrchestrator,
+      this.corpusStore
+    );
+    const knowledgeAgent = new KnowledgeAgent(this.corpusStore);
+    this.server.registerRoutes(new CorpusRoutes(this.corpusStore, corpusBuilder, knowledgeAgent));
+    logger.info('WORKER', 'CorpusRoutes registered');
+
+    this.initializationCompleteFlag = true;
+    this.resolveInitialization();
+    logger.info('SYSTEM', 'Core initialization complete (DB + search ready)');
+  }
+
+  // PROVIDER phase: LLM-touching background workers. In the split design these
+  // move to a separate `drain-service` lifecycled by screen-lock state. For now
+  // they run inline so behavior is identical to upstream.
+  private async initializeProviderPhase(
+    settings: ReturnType<typeof import('../shared/SettingsDefaultsManager.js').SettingsDefaultsManager.loadFromFile>
+  ): Promise<void> {
+    await this.startTranscriptWatcher(settings);
+
+    if (this.chromaMcpManager) {
+      ChromaSync.backfillAllProjects(this.dbManager.getSessionStore()).then(() => {
+        logger.info('CHROMA_SYNC', 'Backfill check complete for all projects');
+      }).catch(error => {
+        logger.error('CHROMA_SYNC', 'Backfill failed (non-blocking)', {}, error as Error);
+      });
+    }
+
+    const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');
+    this.mcpReady = existsSync(mcpServerPath);
+
+    this.runMcpSelfCheck(mcpServerPath).catch(err => {
+      logger.debug('WORKER', 'MCP self-check failed (non-fatal)', { error: err.message });
+    });
   }
 
   private async runMcpSelfCheck(mcpServerPath: string): Promise<void> {
