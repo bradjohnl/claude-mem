@@ -11,19 +11,73 @@
 // in worker-service.ts behind CLAUDE_MEM_SPLIT_DAEMON=1.
 
 import { logger } from '../utils/logger.js';
+import { homedir } from 'os';
+import { join } from 'path';
+import { existsSync } from 'fs';
 
 const POLL_INTERVAL_MS = parseInt(process.env.CLAUDE_MEM_DRAIN_POLL_MS || '2000', 10);
+const DATA_DIR = process.env.CLAUDE_MEM_DATA_DIR || join(homedir(), '.claude-mem');
+const DB_PATH = join(DATA_DIR, 'claude-mem.db');
 
 let shuttingDown = false;
 
+interface QueueStats {
+  pending: number;
+  processing: number;
+  failed: number;
+}
+
+// Opportunistic read-only queue stats. Uses bun:sqlite when available (the
+// bundled runtime), falls back to a no-op if the DB is missing. Read-only by
+// design for Phase 3a — Phase 3b will add the write path (mark processing →
+// call provider → mark done).
+async function readQueueStats(): Promise<QueueStats | null> {
+  if (!existsSync(DB_PATH)) return null;
+  try {
+    // bun:sqlite is the bundled SQLite for the worker — same one used elsewhere.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { Database } = require('bun:sqlite');
+    const db = new Database(DB_PATH, { readonly: true });
+    try {
+      const row = db.prepare(`
+        SELECT
+          SUM(status='pending')    AS pending,
+          SUM(status='processing') AS processing,
+          SUM(status='failed')     AS failed
+        FROM pending_messages
+      `).get() as { pending: number | null; processing: number | null; failed: number | null };
+      return {
+        pending: row.pending ?? 0,
+        processing: row.processing ?? 0,
+        failed: row.failed ?? 0
+      };
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    logger.debug('DRAIN', 'queue stats read failed', { error: err instanceof Error ? err.message : String(err) });
+    return null;
+  }
+}
+
 async function runDrainLoop(): Promise<void> {
+  let tickCount = 0;
   while (!shuttingDown) {
-    // Phase 3 will add the actual drain logic here:
+    tickCount++;
+    // Phase 3b will add the actual write path here:
     //   1. SELECT pending_messages WHERE status='pending' LIMIT N
-    //   2. Mark 'processing'
+    //   2. UPDATE ... SET status='processing'
     //   3. Call provider.startSession against the enrichment llama-server (:8086)
     //   4. Write results back, mark 'done' or 'failed'
     //   5. Tick ChromaSync.backfillAllProjects on a slower cadence
+    //
+    // For now: report queue depth every 30 ticks (~1 min at default 2s poll)
+    if (tickCount % 30 === 1) {
+      const stats = await readQueueStats();
+      if (stats) {
+        logger.info('DRAIN', 'queue depth', stats);
+      }
+    }
     await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
   }
 }

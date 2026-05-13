@@ -262,9 +262,15 @@ export class WorkerService implements WorkerRef {
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
     const sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this, this.completionHandler);
     this.server.registerRoutes(sessionRoutes);
-    attachIngestGeneratorStarter((sessionDbId, source) =>
-      sessionRoutes.ensureGeneratorRunning(sessionDbId, source),
-    );
+    if (process.env.CLAUDE_MEM_SPLIT_DAEMON === '1') {
+      // Split-daemon mode: ingest enqueues to SQLite only. The drain-service
+      // owns generator lifecycle, so don't wire the in-process callback here.
+      logger.info('SYSTEM', 'CLAUDE_MEM_SPLIT_DAEMON=1 → skipping in-process ingest generator starter (drain-service owns LLM work)');
+    } else {
+      attachIngestGeneratorStarter((sessionDbId, source) =>
+        sessionRoutes.ensureGeneratorRunning(sessionDbId, source),
+      );
+    }
     this.server.registerRoutes(new DataRoutes(this.paginationHelper, this.dbManager, this.sessionManager, this.sseBroadcaster, this, this.startTime));
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
     this.server.registerRoutes(new LogsRoutes());
@@ -311,7 +317,12 @@ export class WorkerService implements WorkerRef {
       const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
 
       await this.initializeIntakePhase(settings);
-      await this.initializeProviderPhase(settings);
+
+      if (process.env.CLAUDE_MEM_SPLIT_DAEMON === '1') {
+        logger.info('SYSTEM', 'CLAUDE_MEM_SPLIT_DAEMON=1 → skipping provider phase (drain-service will run it)');
+      } else {
+        await this.initializeProviderPhase(settings);
+      }
 
       return;
     } catch (error) {
